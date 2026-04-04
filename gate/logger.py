@@ -4,16 +4,26 @@ import sqlite3
 from pathlib import Path
 
 from gate.models import Decision
+from gate.scorer import RiskScore
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     TEXT    NOT NULL,
-    tool_name     TEXT    NOT NULL,
-    input_hash    TEXT    NOT NULL,
-    outcome       TEXT    NOT NULL,
-    rule_triggered TEXT   NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT    NOT NULL,
+    tool_name      TEXT    NOT NULL,
+    input_hash     TEXT    NOT NULL,
+    outcome        TEXT    NOT NULL,
+    rule_triggered TEXT    NOT NULL,
+    risk_score     REAL    DEFAULT NULL,
+    anomaly        INTEGER DEFAULT 0
 );
+"""
+
+_MIGRATE = """
+ALTER TABLE audit_log ADD COLUMN risk_score REAL    DEFAULT NULL;
+"""
+_MIGRATE_ANOMALY = """
+ALTER TABLE audit_log ADD COLUMN anomaly    INTEGER DEFAULT 0;
 """
 
 
@@ -27,6 +37,12 @@ class AuditLogger:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(_DDL)
+            # Migrate existing databases that predate Layer 2 columns
+            for stmt in (_MIGRATE, _MIGRATE_ANOMALY):
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass  # Column already exists — safe to ignore
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path)
@@ -35,14 +51,24 @@ class AuditLogger:
     # Write
     # ------------------------------------------------------------------
 
-    def log(self, decision: Decision) -> None:
-        """Insert one Decision row into the audit log."""
+    def log(
+        self,
+        decision: Decision,
+        risk_score: RiskScore | None = None,
+        anomaly: bool = False,
+    ) -> None:
+        """Insert one Decision row into the audit log.
+
+        Layer 2 callers pass risk_score and anomaly to enrich the record.
+        Layer 1-only callers omit both — backwards compatible.
+        """
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO audit_log
-                    (timestamp, tool_name, input_hash, outcome, rule_triggered)
-                VALUES (?, ?, ?, ?, ?)
+                    (timestamp, tool_name, input_hash, outcome, rule_triggered,
+                     risk_score, anomaly)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision.timestamp.isoformat(),
@@ -50,6 +76,8 @@ class AuditLogger:
                     decision.input_hash,
                     decision.outcome.value,
                     decision.rule_triggered,
+                    risk_score.score if risk_score else None,
+                    1 if anomaly else 0,
                 ),
             )
 
