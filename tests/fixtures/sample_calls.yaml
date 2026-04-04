@@ -1,0 +1,64 @@
+# =============================================================================
+# Test Fixtures — Simulated Tool Calls
+# =============================================================================
+#
+# Three scenarios required by CLAUDE.md Layer 1 test harness:
+#
+#   Scenario 1 — whitelist hit:  tool is explicitly permitted -> allowed
+#   Scenario 2 — blacklist hit:  tool is explicitly prohibited -> denied
+#   Scenario 3 — no match:       tool unknown to policy -> denied (no_matching_rule)
+#
+# Scenario 3 is the most important. It proves the deterministic policy has
+# blind spots and makes the gap visible in the audit log — the evidence
+# that drives Layer 2.
+#
+# Tool call schema: Anthropic format {name: str, input: dict}
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Scenario 1 — Whitelist hit
+# read_file is explicitly on the whitelist.
+# Expected: outcome=allowed, rule_triggered=read_file
+# -----------------------------------------------------------------------------
+- scenario: whitelist_hit
+  tool_call:
+    name: read_file
+    input:
+      path: "/tmp/report.txt"
+  expected:
+    outcome: allowed
+    rule_triggered: read_file
+
+# -----------------------------------------------------------------------------
+# Scenario 2 — Blacklist hit
+# execute_shell is explicitly on the blacklist.
+# Expected: outcome=denied, rule_triggered=execute_shell
+# -----------------------------------------------------------------------------
+- scenario: blacklist_hit
+  tool_call:
+    name: execute_shell
+    input:
+      command: "rm -rf /tmp/scratch"
+  expected:
+    outcome: denied
+    rule_triggered: execute_shell
+
+# -----------------------------------------------------------------------------
+# Scenario 3 — No matching rule (default-deny)
+# rename_file appears on neither list. The policy never anticipated it.
+# Expected: outcome=denied, rule_triggered=no_matching_rule
+#
+# This is the gap. The tool is not dangerous on its own, but the policy
+# cannot reason about it — and that silence is the problem. A chain of
+# rename_file calls could be used to stage data exfiltration without
+# triggering a single blacklist hit. Per-call enforcement is blind to this.
+# -----------------------------------------------------------------------------
+- scenario: no_matching_rule
+  tool_call:
+    name: rename_file
+    input:
+      src: "/tmp/internal_report.txt"
+      dst: "/tmp/public/internal_report.txt"
+  expected:
+    outcome: denied
+    rule_triggered: no_matching_rule

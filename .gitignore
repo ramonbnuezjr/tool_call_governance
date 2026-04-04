@@ -1,0 +1,21 @@
+# Runtime
+audit.db
+*.db
+
+# Local Claude Code session data
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# macOS
+.DS_Store

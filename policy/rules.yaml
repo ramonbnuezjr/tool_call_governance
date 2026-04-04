@@ -1,0 +1,61 @@
+# =============================================================================
+# GovernanceGate — Layer 1 Policy
+# =============================================================================
+#
+# Intellectual basis:
+#   - OWASP LLM Top 10 (2025), LLM08: Excessive Agency
+#     https://owasp.org/www-project-top-10-for-large-language-model-applications/
+#     Rationale: AI agents must not have more permissions than the task requires.
+#     Unsanctioned tool use is an agency violation regardless of intent.
+#
+#   - Principle of Least Privilege (PoLP)
+#     NIST SP 800-53 Rev 5, Control AC-6
+#     Rationale: Grant only the minimum permissions necessary. Default posture
+#     is DENY — explicit permission is required, not explicit prohibition.
+#
+# Categorization logic:
+#   WHITELIST — read-only, local, reversible, no external side effects
+#   BLACKLIST — writes, deletes, network calls, external side effects,
+#               irreversible actions, or high blast radius
+#   NEITHER   — ambiguous or unanticipated tools; denied by default as
+#               'no_matching_rule' — these are the Layer 2 signal
+#
+# Tool call schema: Anthropic format {name: str, input: dict}
+#
+# KNOWN LIMITATION:
+#   This policy enforces per-call allow/deny only. It cannot detect privilege
+#   escalation via tool chaining (OWASP LLM08 / Excessive Agency). Sequential
+#   composition attacks are a Layer 2 concern.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# WHITELIST — explicitly permitted
+# Read-only, local, reversible. Low blast radius. No external side effects.
+# -----------------------------------------------------------------------------
+whitelist:
+  - read_file            # read contents of a local file
+  - list_directory       # list files/folders at a path
+  - get_current_time     # return system clock — no side effects
+  - web_search           # read-only external query, no mutation
+  - get_weather          # read-only external API, no mutation
+  - calculate            # pure computation, no I/O
+
+
+# -----------------------------------------------------------------------------
+# BLACKLIST — explicitly prohibited
+# Writes, deletes, network calls with side effects, irreversible actions,
+# or tools with high blast radius. Per OWASP LLM08: these are the capability
+# classes most likely to enable unsanctioned real-world impact.
+# -----------------------------------------------------------------------------
+blacklist:
+  - delete_file          # irreversible destruction of local data
+  - write_file           # mutates local filesystem
+  - execute_shell        # arbitrary code execution — maximum blast radius
+  - send_email           # external side effect, not reversible
+  - send_slack_message   # external side effect, not reversible
+  - write_to_database    # mutates persistent state
+  - deploy_code          # irreversible infrastructure change
+  - create_api_key       # credential creation — privilege escalation risk (LLM08)
+  - delete_api_key       # credential destruction — denial of service risk
+  - make_http_request    # unconstrained external network call
