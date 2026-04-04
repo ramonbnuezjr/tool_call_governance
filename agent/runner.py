@@ -5,10 +5,13 @@ Loads a local GGUF model and prompts it to generate tool calls in Anthropic
 format: {name: str, input: dict}
 
 Each tool call is passed through the full governance stack:
-  Layer 1 — GovernanceGate.evaluate()   → Decision (allow/deny)
-  Layer 2 — RiskScorer.score()          → RiskScore (0.0–1.0)
-  Layer 2 — AnomalyDetector.evaluate()  → AnomalyAlert (flagged or not)
-  Audit   — AuditLogger.log()           → persisted to SQLite
+  Layer 1 — GovernanceGate.evaluate()    → Decision (allow/deny)
+  Layer 2 — RiskScorer.score()           → RiskScore (0.0–1.0)
+  Layer 2 — AnomalyDetector.evaluate()   → AnomalyAlert (flagged or not)
+  Layer 3 — ConsequenceModel.classify()  → blast radius + reversibility
+  Layer 3 — SessionContext.detect()      → cascade pattern detection
+  Layer 3 — EscalationEngine.evaluate()  → PASS or HOLD
+  Audit   — AuditLogger.log()            → single enriched row in SQLite
 
 Metal GPU offloading is enabled for Apple Silicon (n_gpu_layers=-1).
 """
@@ -26,8 +29,11 @@ from gate import (
     AnomalyDetector,
     AuditLogger,
     BaselineModel,
+    ConsequenceModel,
+    EscalationEngine,
     GovernanceGate,
     RiskScorer,
+    SessionContext,
     ToolCall,
 )
 
@@ -79,16 +85,22 @@ class RunResult:
     task: str
     raw_response: str
     tool_call: ToolCall | None
-    outcome: str          # allowed / denied / parse_error
+    # Layer 1
+    outcome: str
     rule_triggered: str
+    # Layer 2
     risk_score: float | None
     anomaly: bool
+    # Layer 3
+    consequence_level: str | None
+    cascade_pattern: str | None
+    escalation_verdict: str | None
 
 
 class AgentRunner:
     """
     Wraps a local Llama model and routes its tool calls through the
-    Layer 1 + Layer 2 governance stack.
+    full Layer 1 + Layer 2 + Layer 3 governance stack.
     """
 
     def __init__(
@@ -99,6 +111,7 @@ class AgentRunner:
         n_gpu_layers: int = -1,
         n_ctx: int = 2048,
         anomaly_threshold: float = 0.65,
+        window_size: int = 5,
         verbose: bool = False,
     ) -> None:
         print(f"Loading model: {model_path}")
@@ -109,13 +122,22 @@ class AgentRunner:
             verbose=verbose,
         )
 
-        self._gate     = GovernanceGate(policy_path=policy_path)
-        self._logger   = AuditLogger(db_path=db_path)
-        self._detector = AnomalyDetector(db_path=db_path, threshold=anomaly_threshold)
+        db = Path(db_path)
 
-        baseline = BaselineModel(db_path=db_path)
+        # Layer 1
+        self._gate = GovernanceGate(policy_path=policy_path)
+
+        # Layer 2
+        self._logger   = AuditLogger(db_path=db)
+        self._detector = AnomalyDetector(db_path=db, threshold=anomaly_threshold)
+        baseline = BaselineModel(db_path=db)
         baseline.build()
-        self._scorer = RiskScorer(baseline=baseline, db_path=db_path)
+        self._scorer = RiskScorer(baseline=baseline, db_path=db)
+
+        # Layer 3
+        self._consequence = ConsequenceModel()
+        self._context     = SessionContext(db_path=db, window_size=window_size)
+        self._escalation  = EscalationEngine()
 
         print("Governance stack ready.\n")
 
@@ -125,21 +147,20 @@ class AgentRunner:
 
     def run(self, task: str) -> RunResult:
         """
-        Give the model a task, parse its tool call response, and run it
-        through the full governance stack.
+        Give the model a task, parse its tool call, and run it through
+        the full three-layer governance stack.
         """
-        raw = self._prompt(task)
+        raw       = self._prompt(task)
         tool_call = self._parse(raw)
 
         if tool_call is None:
+            self._logger.log_parse_error(tool_name="unknown", raw_response=raw)
             return RunResult(
-                task=task,
-                raw_response=raw,
-                tool_call=None,
-                outcome="parse_error",
-                rule_triggered="n/a",
-                risk_score=None,
-                anomaly=False,
+                task=task, raw_response=raw, tool_call=None,
+                outcome="parse_error", rule_triggered="parse_error",
+                risk_score=None, anomaly=False,
+                consequence_level=None, cascade_pattern=None,
+                escalation_verdict=None,
             )
 
         # Layer 1
@@ -149,8 +170,24 @@ class AgentRunner:
         risk  = self._scorer.score(tool_call)
         alert = self._detector.evaluate(risk)
 
-        # Log
-        self._logger.log(decision, risk_score=risk, anomaly=alert.is_anomaly)
+        # Layer 3
+        consequence = self._consequence.classify(tool_call.name)
+        cascade     = self._context.detect(tool_call.name)
+        escalation  = self._escalation.evaluate(
+            tool_name=tool_call.name,
+            consequence_level=consequence.level,
+            risk_score=risk.score,
+            cascade=cascade,
+            anomaly_threshold=0.65,
+        )
+
+        # Log — full stack enriched row
+        self._logger.log(
+            decision,
+            risk_score=risk,
+            anomaly=alert.is_anomaly,
+            escalation=escalation,
+        )
 
         return RunResult(
             task=task,
@@ -160,6 +197,9 @@ class AgentRunner:
             rule_triggered=decision.rule_triggered,
             risk_score=risk.score,
             anomaly=alert.is_anomaly,
+            consequence_level=consequence.level.value,
+            cascade_pattern=cascade.pattern_name,
+            escalation_verdict=escalation.verdict.value,
         )
 
     def run_batch(self, tasks: list[str]) -> list[RunResult]:
@@ -186,19 +226,12 @@ class AgentRunner:
     # ------------------------------------------------------------------
 
     def _parse(self, raw: str) -> ToolCall | None:
-        """
-        Extract a ToolCall from the model's raw text response.
-        Tries strict JSON first, then falls back to regex extraction
-        in case the model adds surrounding prose.
-        """
-        # Try direct parse
         try:
             data = json.loads(raw)
             return ToolCall(name=data["name"], input=data.get("input", {}))
         except (json.JSONDecodeError, KeyError):
             pass
 
-        # Fallback: extract first JSON object from the response
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             try:

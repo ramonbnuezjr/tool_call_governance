@@ -3,7 +3,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from gate.models import Decision
+from datetime import datetime
+
+from gate.escalation import EscalationDecision
+from gate.models import Decision, Outcome
 from gate.scorer import RiskScore
 
 _DDL = """
@@ -25,6 +28,15 @@ ALTER TABLE audit_log ADD COLUMN risk_score REAL    DEFAULT NULL;
 _MIGRATE_ANOMALY = """
 ALTER TABLE audit_log ADD COLUMN anomaly    INTEGER DEFAULT 0;
 """
+_MIGRATE_ESCALATION = """
+ALTER TABLE audit_log ADD COLUMN escalation_verdict TEXT DEFAULT NULL;
+"""
+_MIGRATE_CASCADE = """
+ALTER TABLE audit_log ADD COLUMN cascade_pattern    TEXT DEFAULT NULL;
+"""
+_MIGRATE_CONSEQUENCE = """
+ALTER TABLE audit_log ADD COLUMN consequence_level  TEXT DEFAULT NULL;
+"""
 
 
 class AuditLogger:
@@ -37,8 +49,10 @@ class AuditLogger:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(_DDL)
-            # Migrate existing databases that predate Layer 2 columns
-            for stmt in (_MIGRATE, _MIGRATE_ANOMALY):
+            for stmt in (
+                _MIGRATE, _MIGRATE_ANOMALY,
+                _MIGRATE_ESCALATION, _MIGRATE_CASCADE, _MIGRATE_CONSEQUENCE,
+            ):
                 try:
                     conn.execute(stmt)
                 except Exception:
@@ -56,19 +70,21 @@ class AuditLogger:
         decision: Decision,
         risk_score: RiskScore | None = None,
         anomaly: bool = False,
+        escalation: EscalationDecision | None = None,
     ) -> None:
         """Insert one Decision row into the audit log.
 
-        Layer 2 callers pass risk_score and anomaly to enrich the record.
-        Layer 1-only callers omit both — backwards compatible.
+        Backwards compatible — Layer 1-only callers omit all optional args.
+        Layer 3 callers pass escalation to capture the full stack verdict.
         """
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO audit_log
                     (timestamp, tool_name, input_hash, outcome, rule_triggered,
-                     risk_score, anomaly)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     risk_score, anomaly, escalation_verdict,
+                     cascade_pattern, consequence_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision.timestamp.isoformat(),
@@ -78,6 +94,30 @@ class AuditLogger:
                     decision.rule_triggered,
                     risk_score.score if risk_score else None,
                     1 if anomaly else 0,
+                    escalation.verdict.value if escalation else None,
+                    escalation.cascade.pattern_name if escalation else None,
+                    escalation.consequence_level.value if escalation else None,
+                ),
+            )
+
+    def log_parse_error(self, tool_name: str, raw_response: str) -> None:
+        """
+        Log a parse error as a first-class audit event.
+        Fixes Layer 2 Gap 5 — parse errors were previously silent.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log
+                    (timestamp, tool_name, input_hash, outcome, rule_triggered)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.utcnow().isoformat(),
+                    tool_name or "unknown",
+                    "parse_error",
+                    "parse_error",
+                    "parse_error",
                 ),
             )
 
@@ -100,6 +140,33 @@ class AuditLogger:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM audit_log WHERE outcome = 'denied' ORDER BY id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_held(self) -> list[dict]:
+        """Return decisions where Layer 3 issued a HOLD verdict."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM audit_log
+                WHERE escalation_verdict = 'hold'
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_cascades(self) -> list[dict]:
+        """Return decisions where a cascade pattern was detected."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM audit_log
+                WHERE cascade_pattern IS NOT NULL
+                AND cascade_pattern != 'none'
+                ORDER BY id DESC
+                """
             ).fetchall()
         return [dict(row) for row in rows]
 
