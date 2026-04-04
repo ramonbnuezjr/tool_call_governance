@@ -7,6 +7,9 @@ Scenario 3: no match       -> outcome=denied,   rule_triggered=no_matching_rule
 
 Fixtures are loaded from tests/fixtures/sample_calls.yaml.
 The GovernanceGate is pointed at policy/rules.yaml.
+
+Also includes a full policy smoke test that runs every tool defined in
+rules.yaml and asserts the correct outcome for each one.
 """
 
 from __future__ import annotations
@@ -134,3 +137,29 @@ def test_every_decision_is_logged(gate, logger):
     assert outcomes["read_file"] == "allowed"
     assert outcomes["execute_shell"] == "denied"
     assert outcomes["rename_file"] == "denied"
+
+
+# ---------------------------------------------------------------------------
+# Full policy smoke test — every tool in rules.yaml
+# ---------------------------------------------------------------------------
+
+def _load_policy_tools() -> list[tuple[str, str]]:
+    """
+    Parse rules.yaml and return (tool_name, expected_outcome) pairs for
+    every tool on the whitelist and blacklist.
+    """
+    raw = yaml.safe_load(POLICY_PATH.read_text()) or {}
+    cases = []
+    for name in raw.get("whitelist", []):
+        cases.append((name, "allowed"))
+    for name in raw.get("blacklist", []):
+        cases.append((name, "denied"))
+    return cases
+
+
+@pytest.mark.parametrize("tool_name,expected_outcome", _load_policy_tools())
+def test_policy_smoke(gate, logger, tool_name, expected_outcome):
+    """Every tool in rules.yaml produces the outcome its list implies."""
+    decision = gate.evaluate(ToolCall(name=tool_name, input={}))
+    logger.log(decision)
+    assert decision.outcome.value == expected_outcome
