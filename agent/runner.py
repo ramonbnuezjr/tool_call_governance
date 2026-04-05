@@ -23,8 +23,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from llama_cpp import Llama
-
 from gate import (
     AnomalyDetector,
     AuditLogger,
@@ -114,6 +112,7 @@ class AgentRunner:
         window_size: int = 5,
         verbose: bool = False,
     ) -> None:
+        from llama_cpp import Llama  # lazy import — not needed for tests
         print(f"Loading model: {model_path}")
         self._llm = Llama(
             model_path=str(model_path),

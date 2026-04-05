@@ -37,6 +37,12 @@ ALTER TABLE audit_log ADD COLUMN cascade_pattern    TEXT DEFAULT NULL;
 _MIGRATE_CONSEQUENCE = """
 ALTER TABLE audit_log ADD COLUMN consequence_level  TEXT DEFAULT NULL;
 """
+_MIGRATE_TASK_ID = """
+ALTER TABLE audit_log ADD COLUMN task_id  TEXT DEFAULT NULL;
+"""
+_MIGRATE_ITERATION = """
+ALTER TABLE audit_log ADD COLUMN iteration INTEGER DEFAULT NULL;
+"""
 
 
 class AuditLogger:
@@ -52,6 +58,7 @@ class AuditLogger:
             for stmt in (
                 _MIGRATE, _MIGRATE_ANOMALY,
                 _MIGRATE_ESCALATION, _MIGRATE_CASCADE, _MIGRATE_CONSEQUENCE,
+                _MIGRATE_TASK_ID, _MIGRATE_ITERATION,
             ):
                 try:
                     conn.execute(stmt)
@@ -71,11 +78,14 @@ class AuditLogger:
         risk_score: RiskScore | None = None,
         anomaly: bool = False,
         escalation: EscalationDecision | None = None,
+        task_id: str | None = None,
+        iteration: int | None = None,
     ) -> None:
         """Insert one Decision row into the audit log.
 
         Backwards compatible — Layer 1-only callers omit all optional args.
         Layer 3 callers pass escalation to capture the full stack verdict.
+        Loop callers pass task_id and iteration to group rows by task.
         """
         with self._connect() as conn:
             conn.execute(
@@ -83,8 +93,9 @@ class AuditLogger:
                 INSERT INTO audit_log
                     (timestamp, tool_name, input_hash, outcome, rule_triggered,
                      risk_score, anomaly, escalation_verdict,
-                     cascade_pattern, consequence_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     cascade_pattern, consequence_level,
+                     task_id, iteration)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision.timestamp.isoformat(),
@@ -97,10 +108,18 @@ class AuditLogger:
                     escalation.verdict.value if escalation else None,
                     escalation.cascade.pattern_name if escalation else None,
                     escalation.consequence_level.value if escalation else None,
+                    task_id,
+                    iteration,
                 ),
             )
 
-    def log_parse_error(self, tool_name: str, raw_response: str) -> None:
+    def log_parse_error(
+        self,
+        tool_name: str,
+        raw_response: str,
+        task_id: str | None = None,
+        iteration: int | None = None,
+    ) -> None:
         """
         Log a parse error as a first-class audit event.
         Fixes Layer 2 Gap 5 — parse errors were previously silent.
@@ -109,8 +128,9 @@ class AuditLogger:
             conn.execute(
                 """
                 INSERT INTO audit_log
-                    (timestamp, tool_name, input_hash, outcome, rule_triggered)
-                VALUES (?, ?, ?, ?, ?)
+                    (timestamp, tool_name, input_hash, outcome, rule_triggered,
+                     task_id, iteration)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.utcnow().isoformat(),
@@ -118,6 +138,8 @@ class AuditLogger:
                     "parse_error",
                     "parse_error",
                     "parse_error",
+                    task_id,
+                    iteration,
                 ),
             )
 
@@ -180,5 +202,19 @@ class AuditLogger:
                 WHERE rule_triggered = 'no_matching_rule'
                 ORDER BY id DESC
                 """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_task_trace(self, task_id: str) -> list[dict]:
+        """Return all audit rows for a task, ordered by iteration ASC."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM audit_log
+                WHERE task_id = ?
+                ORDER BY iteration ASC
+                """,
+                (task_id,),
             ).fetchall()
         return [dict(row) for row in rows]
