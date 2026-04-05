@@ -16,6 +16,12 @@ Source: LinkedIn post — "Governance doesn't attach at the policy document. It 
 
 Core insight: individually-scoped components can compose into privilege escalation without any single hop violating its rules. Each step is clean. The cumulative result isn't. Enforcement must live at the execution boundary.
 
+**Live finding (April 5, 2026):** Safety-trained models (e.g., Llama 3.2 3B) may
+pre-empt the gate by refusing dangerous tool calls before they are attempted. This
+creates a hidden dependency on model training that evaporates on model substitution.
+The gate must be designed for a capable, motivated agent with no safety training —
+not the model currently being tested. See `docs/model_behavior_analysis.md`.
+
 ## What Is Being Built
 
 A Python middleware library called `GovernanceGate` — an interceptor that sits between an AI agent/orchestrator and tool execution. Every tool call passes through the gate before it runs.
