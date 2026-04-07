@@ -248,17 +248,16 @@ def test_feedback_content_hold(db, policy, mock_llm_factory):
                                  max_iterations=1)
     result = loop.run("Execute a shell command")
 
-    # execute_shell: outcome=denied, consequence=CRITICAL → escalation=HOLD
+    # Fail-fast: execute_shell denied at L1, L2/L3 never run.
+    # escalation_verdict is None — the denial is the terminal decision.
     it = result.iterations[0]
-    assert it.escalation_verdict == "hold"
+    assert it.outcome == "denied"
+    assert it.escalation_verdict is None   # fail-fast — L3 never reached
+    assert it.consequence_level   is None  # fail-fast — L3 never reached
 
     feedback = it.feedback_message
     assert "GOVERNANCE FEEDBACK" in feedback
     assert "DENIED" in feedback
-    # HOLD verdict should be visible either through consequence or hold language
-    # For denied+CRITICAL: the denied message fires (not the hold branch),
-    # but the iteration records hold. The feedback reflects the denial.
-    # Verify at minimum the feedback is well-formed.
     assert "iteration 1" in feedback
 
 

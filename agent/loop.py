@@ -320,12 +320,17 @@ class AgentLoop:
             )
 
             # --- Build and inject feedback ---
+            # consequence/cascade/escalation are None when L1 denied (fail-fast)
+            consequence_val = consequence.level.value if consequence else None
+            cascade_val     = cascade.pattern_name    if cascade     else None
+            escalation_val  = escalation.verdict.value if escalation else None
+
             feedback = _build_feedback(
                 outcome=decision.outcome.value,
                 rule_triggered=decision.rule_triggered,
-                consequence_level=consequence.level.value,
-                cascade_pattern=cascade.pattern_name,
-                escalation_verdict=escalation.verdict.value,
+                consequence_level=consequence_val,
+                cascade_pattern=cascade_val,
+                escalation_verdict=escalation_val,
                 iteration=i,
             )
             messages.append({"role": "user", "content": feedback})
@@ -336,17 +341,18 @@ class AgentLoop:
                 tool_call=tool_call,
                 outcome=decision.outcome.value,
                 rule_triggered=decision.rule_triggered,
-                risk_score=risk.score,
-                anomaly=alert.is_anomaly,
-                consequence_level=consequence.level.value,
-                cascade_pattern=cascade.pattern_name,
-                escalation_verdict=escalation.verdict.value,
+                risk_score=risk.score if risk else None,
+                anomaly=alert.is_anomaly if alert else False,
+                consequence_level=consequence_val,
+                cascade_pattern=cascade_val,
+                escalation_verdict=escalation_val,
                 feedback_message=feedback,
             ))
 
             # --- Termination: success ---
             if (
                 decision.outcome == Outcome.ALLOWED
+                and escalation is not None
                 and escalation.verdict == EscalationVerdict.PASS
             ):
                 return LoopResult(
@@ -375,9 +381,17 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def _run_governance(self, tool_call: ToolCall) -> tuple:
-        decision    = self._gate.evaluate(tool_call)
+        # Layer 1 — fail-fast: denied calls never reach L2 or L3
+        decision = self._gate.evaluate(tool_call)
+
+        if decision.outcome == Outcome.DENIED:
+            return decision, None, None, None, None, None
+
+        # Layer 2 — only runs when Layer 1 allows
         risk        = self._scorer.score(tool_call)
         alert       = self._detector.evaluate(risk)
+
+        # Layer 3 — only runs when Layer 1 allows
         consequence = self._consequence.classify(tool_call.name)
         cascade     = self._context.detect(tool_call.name)
         escalation  = self._escalation.evaluate(
@@ -394,14 +408,15 @@ class AgentLoop:
         decision: Decision,
         risk,
         alert,
-        escalation: EscalationDecision,
+        escalation: EscalationDecision | None,
         task_id: str,
         iteration: int,
     ) -> None:
+        # risk/alert/escalation are None when Layer 1 denied (fail-fast)
         self._logger.log(
             decision,
             risk_score=risk,
-            anomaly=alert.is_anomaly,
+            anomaly=alert.is_anomaly if alert else False,
             escalation=escalation,
             task_id=task_id,
             iteration=iteration,

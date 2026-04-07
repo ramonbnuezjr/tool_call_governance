@@ -162,14 +162,29 @@ class AgentRunner:
                 escalation_verdict=None,
             )
 
-        # Layer 1
+        # Layer 1 — fail-fast: denied calls never reach L2 or L3
         decision = self._gate.evaluate(tool_call)
 
-        # Layer 2
+        if decision.outcome == Outcome.DENIED:
+            self._logger.log(decision)
+            return RunResult(
+                task=task,
+                raw_response=raw,
+                tool_call=tool_call,
+                outcome="denied",
+                rule_triggered=decision.rule_triggered,
+                risk_score=None,
+                anomaly=False,
+                consequence_level=None,
+                cascade_pattern=None,
+                escalation_verdict=None,
+            )
+
+        # Layer 2 — only runs when Layer 1 allows
         risk  = self._scorer.score(tool_call)
         alert = self._detector.evaluate(risk)
 
-        # Layer 3
+        # Layer 3 — only runs when Layer 1 allows
         consequence = self._consequence.classify(tool_call.name)
         cascade     = self._context.detect(tool_call.name)
         escalation  = self._escalation.evaluate(
@@ -180,7 +195,6 @@ class AgentRunner:
             anomaly_threshold=0.65,
         )
 
-        # Log — full stack enriched row
         self._logger.log(
             decision,
             risk_score=risk,
