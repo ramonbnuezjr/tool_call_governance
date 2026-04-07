@@ -265,3 +265,337 @@ architectural layer after single-agent is fully validated.
    > The tool call is necessary but not sufficient.
    > Cognition — what the model decided before generating the call —
    > remains outside governance reach.
+
+---
+
+## Session: 2026-04-07 — Layer Architecture Interrogation
+
+### Context
+Follow-on session after the dashboard build. Questions focused on understanding
+the internal mechanics of L2 and L3 — specifically how the risk score is
+computed, what "all math" means in practice, and what inputs the cascade
+signal actually uses.
+
+---
+
+### Q: How is the L2 risk score generated? Is it based on whitelist/blacklist status?
+
+**Answer:** Partially right, but with one important correction — the blacklist
+never reaches L2.
+
+L1 writes every decision to the SQLite audit log. L2 reads that log and does
+arithmetic on it. The blacklist is irrelevant to the score because blacklisted
+calls are denied at L1 and the chain stops there (fail-fast). L2 only ever
+evaluates calls that L1 allowed.
+
+The three signals:
+
+| Signal | Weight | What triggers it |
+|---|---|---|
+| Gap | 40% | Tool has ever hit `no_matching_rule` in audit history |
+| Frequency | 35% | Recent call rate exceeds baseline by ≥3x |
+| Sequence | 25% | The immediately preceding audit log entry was denied |
+
+Being whitelisted does not lower your score. A whitelisted tool called 10x
+its baseline rate immediately after a denied call scores high regardless.
+
+The gap signal carries a permanent floor: a tool that was ever in the gap zone
+retains a 0.40 baseline on every future call — even if later added to the
+whitelist. Policy silence in its history is a structural risk indicator.
+
+---
+
+### Q: What does "all math" mean for L2? What does the process actually look like?
+
+**Answer:** L2 has no opinion about what a tool does. It has no understanding
+of intent. The full evaluation is three independent arithmetic operations
+against the audit log.
+
+Step-by-step when a tool call arrives at L2:
+
+**Step 1 — Build the baseline** (reads the entire audit log once)
+
+`BaselineModel` scans every row ever written and produces:
+- A `Counter`: `{"read_file": 42, "web_search": 17, "send_email": 8, ...}`
+- A set of gap tools: any tool that ever hit `no_matching_rule`
+
+No model. Standard library `Counter`.
+
+**Step 2 — Score three signals independently**
+
+*Gap signal* — one set lookup:
+```
+is "rename_file" in gap_tools?  →  YES → signal = 1.0
+```
+
+*Frequency signal* — two SQL queries and a division:
+```
+baseline_rate = (lifetime_count / total_calls) * window_minutes
+recent_rate   = SELECT COUNT(*) WHERE timestamp >= now - 60min
+ratio         = recent_rate / baseline_rate
+ratio >= 3x   → signal = 1.0 (full spike)
+ratio < 1x    → signal = 0.0
+between       → linear interpolation
+```
+
+*Sequence signal* — one SQL query:
+```
+SELECT outcome FROM audit_log ORDER BY id DESC LIMIT 1
+→ "denied"  →  signal = 1.0
+```
+
+**Step 3 — Add and cap:**
+```
+score = min((0.40 × gap) + (0.35 × freq) + (0.25 × seq), 1.0)
+```
+
+Threshold is 0.65. Cross it and L2 flags the call as anomalous.
+
+**Key point:** L1 asks "is this tool on a list?" L2 asks "is this tool
+behaving differently than it has historically?" Different questions.
+Different data sources.
+
+---
+
+### Q: Is L3 just human-in-the-loop?
+
+**Answer:** The human-in-the-loop is the *output* of L3, not L3 itself.
+L3 is two sub-components of deterministic logic that run before a human
+ever sees anything.
+
+**Sub-component 1 — Consequence Model** (`consequence.py`)
+
+A dict lookup. Every known tool is pre-classified on two dimensions:
+- Blast radius: LOW / MEDIUM / HIGH
+- Reversibility: REVERSIBLE / IRREVERSIBLE
+
+Those two produce a consequence level: LOW, MEDIUM, HIGH, or CRITICAL.
+Hard-coded. No math, no model. If the tool isn't in the table, it defaults
+to HIGH — unknown impact is treated as potentially severe.
+
+**Sub-component 2 — Escalation Engine** (`escalation.py`)
+
+Takes three inputs and runs a decision matrix:
+
+```
+CRITICAL consequence  →  always HOLD
+HIGH consequence      →  always HOLD
+Cascade detected      →  always HOLD
+MEDIUM + score ≥ 0.65 →  HOLD
+everything else       →  PASS
+```
+
+If the verdict is HOLD, that's when a human is required.
+
+**Corrected mental model for the full stack:**
+
+| Layer | Mechanism | Question asked |
+|---|---|---|
+| L1 | YAML file lookup | Is this tool permitted by policy? |
+| L2 | SQLite counters + arithmetic | Is this tool behaving abnormally vs. history? |
+| L3 | Dict lookup + decision matrix | Is this tool dangerous in this context? |
+| Human | Approval gate | Should this HOLD be released or blocked? |
+
+No LLM anywhere in the stack. The agent generating the tool call may be an
+LLM — the governance stack evaluating it is entirely deterministic.
+
+---
+
+### Q: Is the cascade signal built from the consequence level and L2 risk score?
+
+**Answer:** No. The cascade signal is a third independent input to the
+escalation engine — computed entirely from the audit log history, specifically
+the last 5 rows. It has nothing to do with consequence level or risk score.
+
+The escalation engine receives three separate inputs:
+
+```
+consequence_level  ←  consequence table dict lookup (tool name)
+risk_score         ←  L2 arithmetic (three-signal math)
+cascade            ←  SessionContext audit log window scan
+```
+
+The cascade detector scans the last 5 audit log rows and checks for four
+named patterns:
+
+| Pattern | What it looks for |
+|---|---|
+| `EXFIL_STAGING` | read → stage (rename/copy/export) → transmit (email/http) |
+| `BOUNDARY_PROBE` | 3+ blacklist denials in the window |
+| `CRED_ESCALATION` | any `create_api_key` or `delete_api_key` in the window |
+| `GAP_FLOOD` | 3+ `no_matching_rule` hits in the window |
+
+The cascade signal can trigger a HOLD on its own — independent of what
+consequence level or risk score say. This is why `list_directory` gets held
+after three blacklist probes: LOW consequence, 0.00 risk score, but
+`BOUNDARY_PROBE` fires from the window and forces HOLD regardless.
+
+**Why three independent inputs matter:** Each input catches a different failure
+mode. A tool can be policy-permitted (L1 pass), behaviorally normal (L2 pass),
+low consequence, and still be part of a dangerous sequence (cascade HOLD). No
+single input is sufficient. All three are needed.
+
+---
+
+## Key Architectural Principles Established This Session
+
+1. **The blacklist is L1-only.** Denied calls never contribute to L2 scores.
+   They contribute to L2's *inputs* only as history — specifically the
+   sequence signal (was the last call denied?) and BOUNDARY_PROBE
+   (how many denials in the window?).
+
+2. **L2 is behavioral, not semantic.** It has no understanding of what a
+   tool does. It only knows how often it has been called and under what
+   conditions. This is both its strength (fast, auditable) and its limit
+   (blind to intent).
+
+3. **L3's three inputs are fully independent.** Consequence level, risk score,
+   and cascade signal are computed from different sources and answer different
+   questions. Any one of them can force a HOLD without the others.
+
+4. **No LLM in the governance stack.** The agent is an LLM. The gate is not.
+   This is deliberate — deterministic enforcement cannot depend on a model
+   that can be substituted, fine-tuned, or prompted differently.
+
+---
+
+## Session: 2026-04-07 — Cascade Patterns, Exfil Staging, and the Role of Each Layer
+
+### Context
+Follow-on session. Questions focused on how allowed tool calls flow through L2
+and L3, why low-risk tools still appear in L3, what tool chaining means in this
+context, and how the EXFIL_STAGING cascade pattern works and is implemented.
+
+---
+
+### Q: Allowed tool calls like calculate, web_search, get_current_time show up
+### in L3 but not visibly in L2. Is that normal?
+
+**Answer:** Yes. All three tools do go through L2 — the risk score is computed
+and written to the audit log. But because they are common, well-behaved tools
+with no gap history, no rate spike, and no post-denial sequence, they score
+0.00. L2 runs and finds nothing interesting, producing no anomaly flag. If the
+dashboard highlights only anomalies, L2 appears silent even though it evaluated
+the call.
+
+L3 always shows something for allowed calls because it writes two values that
+are never null: `consequence_level` (these tools are LOW) and
+`escalation_verdict` (PASS). So the audit row for a clean `calculate` call is:
+
+```
+outcome:            allowed
+risk_score:         0.0      ← L2 ran, scored it, nothing flagged
+anomaly:            0        ← L2 found nothing
+consequence_level:  low      ← L3 classified it
+cascade_pattern:    none     ← L3 checked, no pattern
+escalation_verdict: pass     ← L3 verdict
+```
+
+**Key distinction:** L2 and L3 are not running in order to document — they
+are running in order to decide. The audit log is what they write after
+deciding. The historical record is a side effect of evaluation, not the
+purpose of it.
+
+---
+
+### Q: Is tool chaining what makes the multi-layer evaluation valuable?
+### Like, web_search is allowed at L1 but L2 and L3 catch it for other reasons?
+
+**Answer:** Almost — with one clarification on what "tool chaining" means here.
+
+Tool chaining is what the **agent** does — calling `web_search`, then
+`read_file`, then `send_email` across multiple turns. Each is a separate,
+individual tool call. The governance stack evaluates them one at a time.
+
+But L3's cascade detector is exactly what sees the chain even though the stack
+evaluates calls individually. L3 looks back at the last 5 audit log rows
+before deciding on the current call. So:
+
+```
+Turn 1: read_file   → L1 allowed, L2 clean, L3 pass
+Turn 2: copy_file   → L1 allowed, L2 clean, L3 pass
+Turn 3: web_search  → L1 allowed, L2 clean, L3 — HOLD (EXFIL_STAGING)
+```
+
+`web_search` by itself is fine. But the window contained `read_file` →
+`copy_file` → `web_search`, which matches the exfil pattern.
+
+**Correct mental model — what each layer catches:**
+- **L1** — is this tool permitted by policy? (per call, no history)
+- **L2** — is this tool's call rate suspicious? (per tool, rate history)
+- **L3** — is this sequence of calls suspicious? (session window, pattern match)
+
+L1 allowing something is never the final word.
+
+---
+
+### Q: What is EXFIL_STAGING? Is it a library?
+
+**Answer:** No library. Hand-coded pattern encoded as three Python sets.
+
+"Exfil" is short for data exfiltration — an agent stealing data out of the
+system. EXFIL_STAGING is the three-step sequence present in nearly every
+real data theft:
+
+```
+Step 1 — READ:     read_file, list_directory
+          Find and access the data.
+
+Step 2 — STAGE:    copy_file, rename_file, export_data, write_file
+          Move it somewhere accessible or in a portable format.
+
+Step 3 — TRANSMIT: send_email, make_http_request, web_search, send_slack_message
+          Send it out of the system.
+```
+
+Each step individually is innocent and whitelisted. All three in sequence
+within the session window is a recognized attack pattern.
+
+The implementation in `gate/context.py`:
+
+```python
+_EXFIL_READ     = {"read_file", "list_directory"}
+_EXFIL_STAGE    = {"rename_file", "copy_file", "export_data", "write_file"}
+_EXFIL_TRANSMIT = {"web_search", "make_http_request", "send_email", "send_slack_message"}
+
+def _detect_exfil_staging(self, names, rules):
+    has_read     = any(n in _EXFIL_READ     for n in names)
+    has_stage    = any(n in _EXFIL_STAGE    for n in names)
+    has_transmit = any(n in _EXFIL_TRANSMIT for n in names)
+
+    if has_read and has_stage and has_transmit:
+        → EXFIL_STAGING detected
+```
+
+Three sets. Three membership checks. If all three buckets are represented
+in the window — pattern fires.
+
+The pattern names (`EXFIL_STAGING`, `BOUNDARY_PROBE`, `CRED_ESCALATION`,
+`GAP_FLOOD`) come from security research and OWASP LLM08. The implementation
+is domain knowledge encoded manually. No library, no ML, no external
+dependency.
+
+**Known limitation:** The patterns are only as good as what was anticipated
+when writing the code. A novel exfil sequence using tools not in those sets
+would pass undetected. This is the fundamental constraint of hand-coded
+pattern detection — it cannot anticipate what it was never designed to see.
+
+---
+
+## Key Architectural Principles Established This Session
+
+1. **L1 allowing a call is never the final word.** It means the tool is
+   permitted by policy. L2 and L3 still evaluate it independently.
+
+2. **L2 and L3 run to decide, not to document.** The audit record is a
+   side effect of evaluation. Every allowed call gets a full row regardless
+   of whether the verdict is interesting.
+
+3. **The cascade detector sees sequences the other layers cannot.** L1 and
+   L2 evaluate each call in isolation. L3 evaluates each call in the context
+   of what preceded it. Both perspectives are required.
+
+4. **Hand-coded patterns are fast and auditable but not adaptive.** EXFIL_STAGING
+   fires reliably on known sequences. It is blind to novel compositions that
+   use unanticipated tools. That gap is the argument for a probabilistic or
+   learned detection layer beyond what exists here.
